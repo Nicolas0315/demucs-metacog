@@ -1,16 +1,25 @@
 """
-engine.py — Temporal Metacognition Engine v2
+engine.py — Temporal Metacognition Engine v3
 
-v2の追加:
+v3の追加:
+- Dual-Model並列実行: htdemucs と htdemucs_ft を同時に実行し、
+  PerceptualScores（MAPSS近似）で良い方を自動選択する。
+  これがHuang Limitへの直接的な回答: 外部評価器（perceptual.py）が
+  同一モデルの内部バイアスから独立した判断を下す。
+- VAD統合: vocalsステムに音声活動がなければ早期に警告し、
+  無音ステムへの再試行リソースを無駄にしない。
+- PerceptualScores をEngineResultに含め、CLI出力に反映する。
+
+v2:
 - Intent-Aware: IntentProfileを受け取り、用途に応じた閾値・戦略を適用
-- Targeted Re-separation: 失敗ステムだけを特定し、次のイテレーションで
-  そのステムの監査基準を重点的にチェックする（全ステム再実行だが評価を集中）
-- モデルアップグレード戦略: masteringモードでは再試行時にhtdemucs_ftに切り替える
+- Targeted Re-separation: 失敗ステムのリスト化
+- モデルアップグレード戦略
 """
 from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -18,8 +27,10 @@ import torch
 import torchaudio
 
 from .intent import IntentProfile, SeparationIntent, get_intent_profile
+from .perceptual import PerceptualScores, evaluate_perceptual
 from .quality import QualityReport, evaluate_stems
 from .separator import DemucsBase
+from .vad import VoiceActivity, audit_stems_vad
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +44,15 @@ class EngineConfig:
     device: Optional[str] = None
     max_iterations: int = MAX_ITERATIONS
     quality_thresholds: dict = field(default_factory=dict)
-    retry_strategy: str = "shifts"   # "shifts" | "overlap" | "model_upgrade"
+    retry_strategy: str = "shifts"   # "shifts" | "overlap" | "model_upgrade" | "dual_model"
     save_iterations: bool = False
     verbose: bool = True
     # Intent-Aware設定
     intent: SeparationIntent | str = SeparationIntent.DEFAULT
+    # Dual-Model設定
+    dual_model_name: str = "htdemucs_ft"   # dual_model戦略で使う対抗モデル
+    use_perceptual_eval: bool = True        # MAPSS近似評価を使う
+    use_vad: bool = True                    # VAD評価を使う
 
 
 @dataclass
@@ -48,6 +63,8 @@ class IterationResult:
     elapsed_sec: float
     model_used: str = "htdemucs"
     intent_applied: str = "default"
+    perceptual_scores: dict[str, PerceptualScores] = field(default_factory=dict)
+    vad_results: dict[str, VoiceActivity] = field(default_factory=dict)
 
 
 @dataclass
@@ -80,6 +97,22 @@ class EngineResult:
             model_tag = f" [{r.model_used}]" if r.model_used != "htdemucs" else ""
             lines.append(f"  --- Iter {r.iteration}{model_tag} ({r.elapsed_sec:.1f}s) ---")
             lines.append(r.report.summary())
+            # Perceptualスコアがあれば表示
+            if r.perceptual_scores:
+                method = next(iter(r.perceptual_scores.values())).method
+                lines.append(f"  [Perceptual eval — {method}]")
+                for name, ps in r.perceptual_scores.items():
+                    lines.append(
+                        f"    {name:8s}  PS={ps.ps_score:.3f}  PM={ps.pm_score:.3f}  "
+                        f"combined={ps.combined:.3f}"
+                    )
+            # VAD結果があれば表示
+            if r.vad_results:
+                lines.append("  [VAD]")
+                for name, vad in r.vad_results.items():
+                    activity = f"{vad.activity_ratio:.1%}"
+                    flag = " ⚠️ LOW" if not vad.has_activity else ""
+                    lines.append(f"    {name:8s}  activity={activity}{flag}")
         return "\n".join(lines)
 
 
@@ -191,6 +224,57 @@ class MetaCogEngine:
 
         return stems
 
+    def _dual_model_run(
+        self,
+        waveform: torch.Tensor,
+        sample_rate: int,
+        iteration: int,
+        profile: IntentProfile,
+    ) -> tuple[dict[str, torch.Tensor], str]:
+        """
+        Dual-Model並列実行 (Huang Limit突破戦略)。
+
+        model_name と dual_model_name を ThreadPoolExecutor で並列実行し、
+        PerceptualScores（MAPSS近似）で combined スコアが高い方を選択する。
+        同一モデルの内部バイアスに依存しない「外部評価器」として機能する。
+        """
+        model_a = self.config.model_name
+        model_b = self.config.dual_model_name
+        logger.info(f"[Dual-Model] Parallel: {model_a} vs {model_b}")
+
+        def run_model(name: str) -> tuple[str, dict[str, torch.Tensor]]:
+            stems = self._separate_with_strategy(
+                waveform, sample_rate, iteration=iteration,
+                model_name=name, profile=profile,
+            )
+            return name, stems
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {executor.submit(run_model, m): m for m in [model_a, model_b]}
+            results: dict[str, dict[str, torch.Tensor]] = {}
+            for fut in as_completed(futures):
+                name, stems = fut.result()
+                results[name] = stems
+
+        # ── PerceptualScoreで比較 ─────────────────────────────
+        sep_a = results[model_a]
+        sep_b = results[model_b]
+
+        score_a = evaluate_perceptual(waveform, sep_a, sample_rate, use_wavlm=False)
+        score_b = evaluate_perceptual(waveform, sep_b, sample_rate, use_wavlm=False)
+
+        avg_a = sum(s.combined for s in score_a.values()) / max(len(score_a), 1)
+        avg_b = sum(s.combined for s in score_b.values()) / max(len(score_b), 1)
+
+        winner = model_a if avg_a >= avg_b else model_b
+        winner_stems = results[winner]
+
+        logger.info(
+            f"[Dual-Model] {model_a}={avg_a:.3f}  {model_b}={avg_b:.3f}  "
+            f"→ winner: {winner}"
+        )
+        return winner_stems, winner
+
     def run(self, waveform: torch.Tensor, sample_rate: int) -> EngineResult:
         """
         メタ認知ループを実行する。
@@ -207,7 +291,6 @@ class MetaCogEngine:
         if self.config.verbose:
             logger.info(f"Intent: {profile.intent.value} — {profile.description}")
 
-        # EngineConfigの明示的な閾値でオーバーライドも可能
         quality_thresholds = {
             **profile.to_quality_thresholds(),
             **self.config.quality_thresholds,
@@ -217,14 +300,12 @@ class MetaCogEngine:
         total_start = time.perf_counter()
         iteration_results: list[IterationResult] = []
         best_stems: Optional[dict[str, torch.Tensor]] = None
-
-        # 現在使用するモデル（再試行時に切り替わる可能性あり）
         current_model = self.config.model_name
 
         logger.info(
-            f"MetaCogEngine starting. "
+            f"MetaCogEngine v3 starting. "
             f"intent={profile.intent.value} max_iter={self.config.max_iterations} "
-            f"model={current_model}"
+            f"model={current_model} strategy={self.config.retry_strategy}"
         )
 
         for i in range(self.config.max_iterations):
@@ -232,14 +313,17 @@ class MetaCogEngine:
             logger.info(f"\n--- Iteration {i} (model: {current_model}) ---")
 
             # ── 1. 分離（直感パス）──────────────────────────────────
-            stems = self._separate_with_strategy(
-                waveform, sample_rate,
-                iteration=i,
-                model_name=current_model,
-                profile=profile,
-            )
+            if self.config.retry_strategy == "dual_model":
+                stems, current_model = self._dual_model_run(
+                    waveform, sample_rate, iteration=i, profile=profile,
+                )
+            else:
+                stems = self._separate_with_strategy(
+                    waveform, sample_rate,
+                    iteration=i, model_name=current_model, profile=profile,
+                )
 
-            # ── 2. 品質監査（監査層）────────────────────────────────
+            # ── 2. 品質監査（SNR/Leakage）──────────────────────────
             report = evaluate_stems(
                 original=waveform,
                 stems=stems,
@@ -247,6 +331,31 @@ class MetaCogEngine:
                 stem_snr_thresholds=stem_snr_thresholds,
             )
             report.iteration = i
+
+            # ── 3. Perceptual評価（MAPSS近似）──────────────────────
+            perceptual: dict[str, PerceptualScores] = {}
+            if self.config.use_perceptual_eval:
+                try:
+                    perceptual = evaluate_perceptual(
+                        waveform, stems, sample_rate, use_wavlm=False
+                    )
+                except Exception as e:
+                    logger.warning(f"Perceptual eval failed: {e}")
+
+            # ── 4. VAD（音声活動検出）──────────────────────────────
+            vad_results: dict[str, VoiceActivity] = {}
+            if self.config.use_vad:
+                try:
+                    vad_results = audit_stems_vad(stems, sample_rate)
+                    # vocalsが無声なら注意ノートを追加
+                    if "vocals" in vad_results and not vad_results["vocals"].has_activity:
+                        report.notes.append(
+                            "VAD: vocals has no detectable activity — "
+                            "may be instrumental or separation failed"
+                        )
+                except Exception as e:
+                    logger.warning(f"VAD eval failed: {e}")
+
             elapsed = time.perf_counter() - iter_start
 
             iteration_results.append(IterationResult(
@@ -256,6 +365,8 @@ class MetaCogEngine:
                 elapsed_sec=round(elapsed, 2),
                 model_used=current_model,
                 intent_applied=profile.intent.value,
+                perceptual_scores=perceptual,
+                vad_results=vad_results,
             ))
 
             if self.config.verbose:
@@ -263,17 +374,16 @@ class MetaCogEngine:
 
             best_stems = stems
 
-            # ── 3. 合格判定 ────────────────────────────────────────
+            # ── 5. 合格判定 ────────────────────────────────────────
             if report.overall_passed:
                 logger.info(f"✅ Quality passed at iteration {i}")
                 break
 
-            # ── 4. 失敗分析とモデル切り替え判断 ──────────────────
+            # ── 6. 失敗分析とモデル切り替え判断 ──────────────────
             if i < self.config.max_iterations - 1:
                 failed = report.failed_stems
                 logger.info(f"⚠️  Failed stems: {failed}. Adjusting strategy...")
 
-                # model_upgradeストラテジー: profile指定のretry_modelに切り替える
                 if (
                     self.config.retry_strategy == "model_upgrade"
                     and profile.retry_model

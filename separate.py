@@ -26,9 +26,14 @@ def separate(
     output_dir: Path = typer.Option(Path("output"), "--output-dir", "-o", help="出力ディレクトリ"),
     model: str = typer.Option("htdemucs", "--model", "-m", help="Demucsモデル名"),
     max_iter: int = typer.Option(3, "--max-iter", help="最大イテレーション数"),
-    strategy: str = typer.Option("shifts", "--strategy", help="再分離戦略: shifts | overlap | model_upgrade"),
+    strategy: str = typer.Option("shifts", "--strategy",
+                                  help="再分離戦略: shifts | overlap | model_upgrade | dual_model"),
+    dual_model: str = typer.Option("htdemucs_ft", "--dual-model",
+                                   help="dual_model戦略で対戦させるモデル名"),
     intent: str = typer.Option("default", "--intent", "-i",
                                 help="用途: default | karaoke | sample | remix | analysis | mastering"),
+    no_perceptual: bool = typer.Option(False, "--no-perceptual", help="MAPSS近似評価を無効化"),
+    no_vad: bool = typer.Option(False, "--no-vad", help="VAD評価を無効化"),
     verbose: bool = typer.Option(True, "--verbose/--quiet"),
     save_all: bool = typer.Option(False, "--save-all", help="全イテレーションの結果を保存"),
     device: str = typer.Option("auto", "--device", help="cpu | cuda | mps | auto"),
@@ -59,14 +64,17 @@ def separate(
 
     _device = None if device == "auto" else device
 
+    dual_tag = f" vs {dual_model}" if strategy == "dual_model" else ""
     console.print(Panel(
-        f"[bold cyan]MetaCog Stem Separator[/bold cyan]\n"
-        f"Input   : {input_file}\n"
-        f"Model   : {model}\n"
-        f"Intent  : [bold yellow]{intent}[/bold yellow] — {profile.description}\n"
-        f"MaxIter : {max_iter}\n"
-        f"Strategy: {strategy}\n"
-        f"Output  : {output_dir}",
+        f"[bold cyan]MetaCog Stem Separator v3[/bold cyan]\n"
+        f"Input      : {input_file}\n"
+        f"Model      : {model}{dual_tag}\n"
+        f"Intent     : [bold yellow]{intent}[/bold yellow] — {profile.description}\n"
+        f"MaxIter    : {max_iter}\n"
+        f"Strategy   : {strategy}\n"
+        f"Perceptual : {'off' if no_perceptual else 'on (MAPSS approx)'}\n"
+        f"VAD        : {'off' if no_vad else 'on'}\n"
+        f"Output     : {output_dir}",
         title="⚡ Config"
     ))
 
@@ -83,7 +91,10 @@ def separate(
         device=_device,
         max_iterations=max_iter,
         retry_strategy=strategy,
+        dual_model_name=dual_model,
         intent=intent,
+        use_perceptual_eval=not no_perceptual,
+        use_vad=not no_vad,
         verbose=verbose,
     )
     engine = MetaCogEngine(config)
