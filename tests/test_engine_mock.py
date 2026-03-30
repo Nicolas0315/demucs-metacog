@@ -1,5 +1,5 @@
 """
-test_engine_mock.py — MetaCogEngineのモックテスト
+test_engine_mock.py — MetaCogEngineのモックテスト (v2)
 Demucsモデルをモック化してエンジンのループロジックだけを検証する。
 """
 import math
@@ -13,6 +13,7 @@ import torch
 import pytest
 
 from demucs_metacog.engine import EngineConfig, MetaCogEngine, IterationResult, EngineResult
+from demucs_metacog.intent import SeparationIntent
 from demucs_metacog.quality import QualityReport, StemQuality
 
 
@@ -31,47 +32,65 @@ def _make_mock_stems():
     }
 
 
+def _make_pass_report(stems):
+    sq_map = {k: StemQuality(k, snr_db=15.0, energy_ratio=0.3, leakage_ratio=0.1, passed=True)
+              for k in stems}
+    return QualityReport(stems=sq_map, overall_passed=True, failed_stems=[])
+
+
+def _make_fail_report(stems):
+    sq_map = {k: StemQuality(k, snr_db=1.0, energy_ratio=0.3, leakage_ratio=0.6, passed=False,
+                             reason="SNR low")
+              for k in stems}
+    return QualityReport(stems=sq_map, overall_passed=False, retry_needed=True,
+                         failed_stems=list(stems.keys()))
+
+
+# v2のシグネチャ: (self, waveform, sr, iteration, model_name, profile)
+def _mock_separate(waveform, sr, iteration, model_name, profile):
+    return _make_mock_stems()
+
+
 class TestEngineResult:
-    """EngineResultの基本プロパティテスト。"""
 
     def test_n_iterations(self):
-        waveform = _make_sine()
         stems = _make_mock_stems()
-
-        # QualityReportを手動作成
-        sq = StemQuality("vocals", snr_db=10.0, energy_ratio=0.5, crosstalk_db=-15.0, passed=True)
-        report = QualityReport(stems={"vocals": sq}, overall_passed=True)
-
-        iter_result = IterationResult(iteration=0, stems=stems, report=report, elapsed_sec=1.0)
+        report = _make_pass_report(stems)
+        iter_result = IterationResult(iteration=0, stems=stems, report=report,
+                                      elapsed_sec=1.0, model_used="htdemucs")
         result = EngineResult(
-            final_stems=stems,
-            sample_rate=44100,
-            iterations=[iter_result],
-            total_elapsed_sec=1.5,
+            final_stems=stems, sample_rate=44100,
+            iterations=[iter_result], total_elapsed_sec=1.5, intent="default"
         )
-
         assert result.n_iterations == 1
         assert result.final_report.overall_passed is True
 
     def test_summary_contains_metadata(self):
-        waveform = _make_sine()
         stems = _make_mock_stems()
-        sq = StemQuality("vocals", snr_db=10.0, energy_ratio=0.5, crosstalk_db=-15.0, passed=True)
-        report = QualityReport(stems={"vocals": sq}, overall_passed=True)
-        iter_result = IterationResult(iteration=0, stems=stems, report=report, elapsed_sec=1.0)
+        report = _make_pass_report(stems)
+        iter_result = IterationResult(iteration=0, stems=stems, report=report,
+                                      elapsed_sec=1.0, model_used="htdemucs")
         result = EngineResult(
-            final_stems=stems,
-            sample_rate=44100,
-            iterations=[iter_result],
-            total_elapsed_sec=1.5,
+            final_stems=stems, sample_rate=44100,
+            iterations=[iter_result], total_elapsed_sec=1.5, intent="karaoke"
         )
         summary = result.summary()
         assert "MetaCog Engine Result" in summary
-        assert "1" in summary  # n_iterations
+        assert "karaoke" in summary
+
+    def test_summary_contains_intent(self):
+        stems = _make_mock_stems()
+        report = _make_pass_report(stems)
+        iter_result = IterationResult(iteration=0, stems=stems, report=report,
+                                      elapsed_sec=1.0, model_used="htdemucs")
+        result = EngineResult(
+            final_stems=stems, sample_rate=44100,
+            iterations=[iter_result], total_elapsed_sec=1.5, intent="sample"
+        )
+        assert "sample" in result.summary()
 
 
 class TestEngineConfig:
-    """EngineConfigのデフォルト値テスト。"""
 
     def test_defaults(self):
         config = EngineConfig()
@@ -79,136 +98,102 @@ class TestEngineConfig:
         assert config.max_iterations == 3
         assert config.retry_strategy == "shifts"
         assert config.verbose is True
+        assert config.intent == SeparationIntent.DEFAULT
 
-    def test_custom_config(self):
+    def test_custom_config_with_intent(self):
         config = EngineConfig(
             model_name="htdemucs_ft",
             max_iterations=2,
             retry_strategy="overlap",
+            intent=SeparationIntent.KARAOKE,
             verbose=False,
         )
         assert config.model_name == "htdemucs_ft"
-        assert config.max_iterations == 2
-        assert config.retry_strategy == "overlap"
+        assert config.intent == SeparationIntent.KARAOKE
+
+    def test_intent_as_string(self):
+        """intentを文字列で渡せること。"""
+        config = EngineConfig(intent="remix")
+        # engine.run()内でget_intent_profile()が文字列を受け取れる
+        from demucs_metacog.intent import get_intent_profile
+        profile = get_intent_profile(config.intent)
+        assert profile.intent == SeparationIntent.REMIX
 
 
 class TestEngineLoopLogic:
-    """エンジンのループロジックをモックでテスト。"""
 
-    def _make_engine_with_mock(self, pass_on_iteration: int = 0, max_iter: int = 3):
-        """
-        指定したイテレーションで品質チェックをパスするモックエンジンを作る。
-        実際のDemucsモデルはロードしない。
-        """
-        config = EngineConfig(max_iterations=max_iter, verbose=False)
+    def _make_engine(self, config, pass_fn):
+        """テスト用エンジンを生成するヘルパー。"""
         engine = MetaCogEngine(config)
-
-        call_count = {"n": 0}
-
-        def mock_separate(waveform, sr, iteration):
-            return _make_mock_stems()
-
-        def mock_evaluate(original, stems, thresholds=None):
-            i = call_count["n"]
-            call_count["n"] += 1
-            passed = (i >= pass_on_iteration)
-            sq_map = {
-                k: StemQuality(k, snr_db=10.0 if passed else 2.0,
-                               energy_ratio=0.3, crosstalk_db=-14.0,
-                               passed=passed)
-                for k in stems
-            }
-            return QualityReport(
-                stems=sq_map,
-                overall_passed=passed,
-                retry_needed=not passed,
-            )
-
-        engine._separate_with_strategy = mock_separate
-
-        import demucs_metacog.engine as eng_mod
-        engine._evaluate = mock_evaluate  # 直接差し替えは難しいのでpatchを使う
-        return engine, mock_evaluate
+        engine._separate_with_strategy = _mock_separate
+        mock_sep = MagicMock()
+        mock_sep.sample_rate = 44100
+        engine._separators["htdemucs"] = mock_sep
+        engine._separators[config.model_name] = mock_sep
+        return engine
 
     @patch("demucs_metacog.engine.evaluate_stems")
     def test_stops_early_when_quality_passes(self, mock_eval):
-        """品質チェックがパスしたら早期終了すること。"""
-        # iter=0でパス → 1イテレーションで終わるべき
-        def side_effect(original, stems, thresholds=None):
-            sq_map = {k: StemQuality(k, 15.0, 0.3, -16.0, True) for k in stems}
-            return QualityReport(stems=sq_map, overall_passed=True)
-
-        mock_eval.side_effect = side_effect
+        """品質チェックがパスしたら1イテレーションで終わること。"""
+        # engine.pyはすべてキーワード引数で呼ぶ → **kwargs で受け取る
+        mock_eval.side_effect = lambda **kw: _make_pass_report(kw["stems"])
 
         config = EngineConfig(max_iterations=3, verbose=False)
-        engine = MetaCogEngine(config)
+        engine = self._make_engine(config, None)
 
-        # _separate_with_strategy をモック化
-        engine._separate_with_strategy = lambda w, sr, iteration: _make_mock_stems()
-
-        waveform = _make_sine()
-        result = engine.run(waveform, 44100)
-
+        result = engine.run(_make_sine(), 44100)
         assert result.n_iterations == 1
         assert mock_eval.call_count == 1
 
     @patch("demucs_metacog.engine.evaluate_stems")
     def test_runs_max_iterations_when_always_fails(self, mock_eval):
-        """常に失敗する場合はmax_iterationsまで実行すること。"""
-        def side_effect(original, stems, thresholds=None):
-            sq_map = {k: StemQuality(k, 1.0, 0.3, -2.0, False, "SNR low") for k in stems}
-            return QualityReport(stems=sq_map, overall_passed=False, retry_needed=True)
-
-        mock_eval.side_effect = side_effect
+        """常に失敗するとmax_iterationsまで実行すること。"""
+        mock_eval.side_effect = lambda **kw: _make_fail_report(kw["stems"])
 
         config = EngineConfig(max_iterations=3, verbose=False)
-        engine = MetaCogEngine(config)
-        engine._separate_with_strategy = lambda w, sr, iteration: _make_mock_stems()
+        engine = self._make_engine(config, None)
 
-        waveform = _make_sine()
-        result = engine.run(waveform, 44100)
-
+        result = engine.run(_make_sine(), 44100)
         assert result.n_iterations == 3
         assert mock_eval.call_count == 3
 
     @patch("demucs_metacog.engine.evaluate_stems")
     def test_passes_on_second_iteration(self, mock_eval):
-        """2回目のイテレーションでパスする場合。"""
+        """2回目でパスする場合。"""
         call_count = {"n": 0}
 
-        def side_effect(original, stems, thresholds=None):
+        def side_effect(**kw):
             i = call_count["n"]
             call_count["n"] += 1
-            passed = (i == 1)  # 2回目(index=1)でパス
-            sq_map = {k: StemQuality(k, 15.0 if passed else 2.0, 0.3, -16.0, passed) for k in stems}
-            return QualityReport(stems=sq_map, overall_passed=passed, retry_needed=not passed)
+            return _make_pass_report(kw["stems"]) if i == 1 else _make_fail_report(kw["stems"])
 
         mock_eval.side_effect = side_effect
 
         config = EngineConfig(max_iterations=3, verbose=False)
-        engine = MetaCogEngine(config)
-        engine._separate_with_strategy = lambda w, sr, iteration: _make_mock_stems()
+        engine = self._make_engine(config, None)
 
-        waveform = _make_sine()
-        result = engine.run(waveform, 44100)
-
+        result = engine.run(_make_sine(), 44100)
         assert result.n_iterations == 2
         assert result.final_report.overall_passed is True
 
     @patch("demucs_metacog.engine.evaluate_stems")
     def test_result_has_all_stems(self, mock_eval):
-        """最終結果に全ステムが含まれること。"""
-        def side_effect(original, stems, thresholds=None):
-            sq_map = {k: StemQuality(k, 15.0, 0.3, -16.0, True) for k in stems}
-            return QualityReport(stems=sq_map, overall_passed=True)
-
-        mock_eval.side_effect = side_effect
+        mock_eval.side_effect = lambda **kw: _make_pass_report(kw["stems"])
 
         config = EngineConfig(max_iterations=3, verbose=False)
-        engine = MetaCogEngine(config)
-        engine._separate_with_strategy = lambda w, sr, iteration: _make_mock_stems()
+        engine = self._make_engine(config, None)
 
-        waveform = _make_sine()
-        result = engine.run(waveform, 44100)
-
+        result = engine.run(_make_sine(), 44100)
         assert set(result.final_stems.keys()) == {"vocals", "drums", "bass", "other"}
+
+    @patch("demucs_metacog.engine.evaluate_stems")
+    def test_intent_applied_to_iterations(self, mock_eval):
+        """intent情報がイテレーション結果に記録されること。"""
+        mock_eval.side_effect = lambda **kw: _make_pass_report(kw["stems"])
+
+        config = EngineConfig(max_iterations=3, verbose=False, intent=SeparationIntent.KARAOKE)
+        engine = self._make_engine(config, None)
+
+        result = engine.run(_make_sine(), 44100)
+        assert result.intent == "karaoke"
+        assert result.iterations[0].intent_applied == "karaoke"
